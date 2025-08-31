@@ -46,21 +46,6 @@ def verify_proxy(proxy: str) -> None:
     if not PROXY_PATTERN.match(proxy):
         raise ProxyFormatException(f'Invalid proxy: {proxy}')
 
-
-class _SanitizedCID(CaseInsensitiveDict):
-    def __setitem__(self, key, value):
-        super().__setitem__(key, None if value is None else str(value))
-    def update(self, other=None, **kwargs):
-        if other:
-            if hasattr(other, "items"):
-                other = {k: (None if v is None else str(v)) for k, v in other.items()}
-            else:
-                other = [(k, None if v is None else str(v)) for k, v in other]
-        if kwargs:
-            kwargs = {k: (None if v is None else str(v)) for k, v in kwargs.items()}
-        return super().update(other, **kwargs)
-
-
 def _to_str(x) -> str:
     if isinstance(x, (bytes, bytearray)):
         return x.decode("latin-1", errors="replace")
@@ -347,7 +332,7 @@ class TLSClient:
             network_timeout=1e9,
         )
         # CookieJar containing all currently outstanding cookies set on this session
-        self.headers: CaseInsensitiveDict = _SanitizedCID()
+        self.headers: CaseInsensitiveDict = CaseInsensitiveDict()
         self.cookies: RequestsCookieJar = self.cookies or RequestsCookieJar()
         self._closed: bool = False  # indicate if session is closed
 
@@ -403,7 +388,7 @@ class TLSClient:
         elif headers is None:
             headers = self.headers
         else:
-            merged_headers = _SanitizedCID(self.headers)
+            merged_headers = CaseInsensitiveDict(self.headers)
             merged_headers.update(headers)   # значения приведутся к str
             none_keys = [k for (k, v) in merged_headers.items() if v is None or k is None]
             for key in none_keys:
