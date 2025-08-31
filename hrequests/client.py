@@ -2,11 +2,12 @@ import base64
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Union, Mapping
 from urllib.parse import urlencode
 
 from geventhttpclient import HTTPClient
-from orjson import dumps, loads
+from geventhttpclient.header import Headers
+from orjson import dumps, loads, JSONDecodeError
 
 import hrequests
 from hrequests.cffi import library
@@ -39,6 +40,94 @@ def verify_proxy(proxy: str) -> None:
     if not PROXY_PATTERN.match(proxy):
         raise ProxyFormatException(f'Invalid proxy: {proxy}')
 
+_JSON_CT_HINTS = ("application/json", "+json")
+
+from .toolbelt import CaseInsensitiveDict
+
+class _SanitizedCID(CaseInsensitiveDict):
+    def __setitem__(self, key, value):
+        super().__setitem__(key, None if value is None else str(value))
+    def update(self, other=None, **kwargs):
+        if other:
+            if hasattr(other, "items"):
+                other = {k: (None if v is None else str(v)) for k, v in other.items()}
+            else:
+                other = [(k, None if v is None else str(v)) for k, v in other]
+        if kwargs:
+            kwargs = {k: (None if v is None else str(v)) for k, v in kwargs.items()}
+        return super().update(other, **kwargs)
+
+
+def _to_str(x) -> str:
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode("latin-1", errors="replace")
+    return str(x)
+
+def _normalize_headers(headers_obj) -> dict[str, object]:
+    if not headers_obj:
+        return {}
+    from collections.abc import Mapping as _Mapping
+    if isinstance(headers_obj, _Mapping):
+        out = {}
+        for k, v in headers_obj.items():
+            k = _to_str(k)
+            if isinstance(v, (list, tuple)):
+                out[k] = [_to_str(x) for x in v]
+            else:
+                out[k] = _to_str(v)
+        return out
+    out = {}
+    try:
+        for pair in headers_obj:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            k, v = pair
+            k = _to_str(k); v = _to_str(v)
+            if k in out:
+                if isinstance(out[k], list):
+                    out[k].append(v)
+                else:
+                    out[k] = [out[k], v]
+            else:
+                out[k] = v
+    except Exception:
+        return {}
+    return out
+
+def _get_header(headers: Mapping[str, object], name: str) -> Optional[str]:
+    name_l = name.lower()
+    for k, v in (headers or {}).items():
+        if str(k).lower() == name_l:
+            if isinstance(v, (list, tuple)):
+                return _to_str(v[0]) if v else None
+            return _to_str(v)
+    return None
+
+def _maybe_gunzip(body: bytes, headers: Mapping[str, object]) -> bytes:
+    enc = (_get_header(headers, "Content-Encoding") or "").lower()
+    if "gzip" in enc and body and not (body.startswith(b"{") or body.startswith(b"[")):
+        from gzip import decompress as gunzip
+        try:
+            return gunzip(body)
+        except Exception as e:
+            raise RuntimeError(f"Gzip decompress failed: {e}. Prefix={body[:80]!r}") from e
+    return body
+
+def _looks_like_json_bytes(b: bytes) -> bool:
+    b = b.lstrip()
+    return b.startswith(b"{") or b.startswith(b"[")
+
+def _unwrap_bytearray_repr(body: bytes) -> Optional[bytes]:
+    if not body.startswith(b"bytearray("):
+        return None
+    from ast import literal_eval
+    try:
+        obj = literal_eval(body.decode("utf-8", "replace"))
+        if isinstance(obj, (bytearray, bytes)):
+            return bytes(obj)
+    except Exception:
+        pass
+    return None
 
 @dataclass
 class TLSClient:
@@ -256,6 +345,7 @@ class TLSClient:
             network_timeout=1e9,
         )
         # CookieJar containing all currently outstanding cookies set on this session
+        self.headers: CaseInsensitiveDict = _SanitizedCID()
         self.cookies: RequestsCookieJar = self.cookies or RequestsCookieJar()
         self._closed: bool = False  # indicate if session is closed
 
@@ -295,7 +385,7 @@ class TLSClient:
                 json = dumps(json).decode('utf-8')
             request_body = json
             content_type = 'application/json'
-        elif data is not None and type(data) not in (str, bytes):
+        elif data is not None and type(data) not in (str, bytes, bytearray):
             request_body = urlencode(data, doseq=True)
             content_type = 'application/x-www-form-urlencoded'
         else:
@@ -311,14 +401,11 @@ class TLSClient:
         elif headers is None:
             headers = self.headers
         else:
-            merged_headers = CaseInsensitiveDict(self.headers)
-            merged_headers.update(headers)
-
-            # Remove items, where the key or value is set to None.
+            merged_headers = _SanitizedCID(self.headers)
+            merged_headers.update(headers)   # значения приведутся к str
             none_keys = [k for (k, v) in merged_headers.items() if v is None or k is None]
             for key in none_keys:
                 del merged_headers[key]
-
             headers = merged_headers
 
         # Cookies
@@ -349,7 +436,7 @@ class TLSClient:
             'catchPanics': self.catch_panics,
             'headers': dict(headers) if isinstance(headers, CaseInsensitiveDict) else headers,
             'headerOrder': self.header_order,
-            'insecureSkipVerify': not verify,
+            'insecureSkipVerify': not verify if verify is not None else False,
             'isByteRequest': is_byte_request,
             'detectEncoding': self.detect_encoding,
             'additionalDecode': self.additional_decode,
@@ -357,10 +444,12 @@ class TLSClient:
             'requestUrl': url,
             'requestMethod': method,
             'requestBody': (
-                base64.b64encode(request_body).decode() if is_byte_request else request_body
+                base64.b64encode(request_body).decode()
+                if is_byte_request and request_body is not None
+                else request_body
             ),
             'requestCookies': cookiejar_to_list(self.cookies),
-            'timeoutMilliseconds': int(timeout * 1000),
+            'timeoutMilliseconds': int((timeout or 0) * 1000),
             'withoutCookieJar': False,
             'disableIPv6': self.disable_ipv6,
         }
@@ -443,13 +532,58 @@ class TLSClient:
         '''
         # build request payload
         request_payload, headers = self.build_request(method, url, headers, *args, **kwargs)
-        try:
-            # send request
-            resp = self.server.post(
-                f'http://127.0.0.1:{library.PORT}/request', body=dumps(request_payload)
+
+        # приводим headers в payload к простому dict[str,str]
+        safe_headers = {}
+        for k, v in (request_payload.get('headers') or {}).items():
+            if v is None:
+                continue
+            safe_headers[str(k)] = str(v)
+        request_payload['headers'] = safe_headers
+
+        payload_bytes = dumps(request_payload)
+
+        # ВАЖНО: используем geventhttpclient.header.Headers, чтобы избежать str/bytes-каши
+        req_headers = Headers()
+        req_headers.add('Content-Type', 'application/json')
+        req_headers.add('Accept', 'application/json')
+
+        resp = self.server.post(
+            f'http://127.0.0.1:{library.PORT}/request',
+            body=payload_bytes,
+            headers=req_headers,
+        )
+
+        raw = resp.read()
+        status = getattr(resp, "status_code", getattr(resp, "status", "NA"))
+        resp_headers = _normalize_headers(getattr(resp, "headers", {}) or {})
+
+        if not raw:
+            raise ValueError("Empty response body from local proxy /request")
+
+        body = _maybe_gunzip(raw, resp_headers)
+        print(f"[local-proxy] status={status} prefix={body[:120]!r}")
+
+        if not _looks_like_json_bytes(body):
+            unwrapped = _unwrap_bytearray_repr(body)
+            if unwrapped is not None:
+                body = unwrapped
+
+        if not _looks_like_json_bytes(body):
+            ct = _get_header(resp_headers, "Content-Type") or ""
+            if body.lstrip().startswith(b"<") or ("html" in ct.lower()):
+                raise RuntimeError(
+                    f"Local proxy returned HTML/error page (status={status}), not JSON. "
+                    f"Content-Type={ct!r}, prefix={body[:120]!r}"
+                )
+            raise RuntimeError(
+                f"Local proxy returned non-JSON payload (status={status}). "
+                f"Content-Type={ct!r}, prefix={body[:120]!r}"
             )
-            response_object = loads(resp.read())
-        except Exception as e:
-            raise ClientException('Request failed') from e
-        # build response class
+
+        try:
+            response_object = loads(body)
+        except JSONDecodeError as e:
+            raise JSONDecodeError(f"{e}: prefix={body[:160]!r}", e.doc, e.pos)
+
         return self.build_response(url, headers, response_object, request_payload['proxyUrl'])
