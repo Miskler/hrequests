@@ -9,6 +9,8 @@ from geventhttpclient import HTTPClient
 from geventhttpclient.header import Headers
 from orjson import dumps, loads, JSONDecodeError
 
+from gzip import decompress as gunzip
+
 import hrequests
 from hrequests.cffi import library
 from hrequests.proxies import BaseProxy
@@ -40,9 +42,6 @@ def verify_proxy(proxy: str) -> None:
     if not PROXY_PATTERN.match(proxy):
         raise ProxyFormatException(f'Invalid proxy: {proxy}')
 
-_JSON_CT_HINTS = ("application/json", "+json")
-
-from .toolbelt import CaseInsensitiveDict
 
 class _SanitizedCID(CaseInsensitiveDict):
     def __setitem__(self, key, value):
@@ -106,7 +105,6 @@ def _get_header(headers: Mapping[str, object], name: str) -> Optional[str]:
 def _maybe_gunzip(body: bytes, headers: Mapping[str, object]) -> bytes:
     enc = (_get_header(headers, "Content-Encoding") or "").lower()
     if "gzip" in enc and body and not (body.startswith(b"{") or body.startswith(b"[")):
-        from gzip import decompress as gunzip
         try:
             return gunzip(body)
         except Exception as e:
