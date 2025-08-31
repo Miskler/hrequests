@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Union, Mapping
 from urllib.parse import urlencode
 
-from collections.abc import Mapping as _Mapping
+from collections.abc import Mapping as ABCMapping
 
 from ast import literal_eval
 
@@ -46,31 +46,36 @@ def verify_proxy(proxy: str) -> None:
     if not PROXY_PATTERN.match(proxy):
         raise ProxyFormatException(f'Invalid proxy: {proxy}')
 
-def _to_str(x) -> str:
-    if isinstance(x, (bytes, bytearray)):
-        return x.decode("latin-1", errors="replace")
-    return str(x)
+def _as_text(value) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        # HTTP headers are standardized as latin-1
+        return value.decode("latin-1", errors="replace")
+    return str(value)
 
-def _normalize_headers(headers_obj) -> dict[str, object]:
+def normalize_headers_container(headers_obj) -> dict[str, object]:
+    """
+    Converts any headers (dict, generator of pairs, bytes keys/values)
+    to a regular dict[str, str|list[str]].
+    """
     if not headers_obj:
         return {}
-    
-    if isinstance(headers_obj, _Mapping):
-        out = {}
+
+    if isinstance(headers_obj, ABCMapping):
+        out: dict[str, object] = {}
         for k, v in headers_obj.items():
-            k = _to_str(k)
+            k = _as_text(k)
             if isinstance(v, (list, tuple)):
-                out[k] = [_to_str(x) for x in v]
+                out[k] = [_as_text(x) for x in v]
             else:
-                out[k] = _to_str(v)
+                out[k] = _as_text(v)
         return out
-    out = {}
+
+    out: dict[str, object] = {}
     try:
         for pair in headers_obj:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 continue
-            k, v = pair
-            k = _to_str(k); v = _to_str(v)
+            k, v = _as_text(pair[0]), _as_text(pair[1])
             if k in out:
                 if isinstance(out[k], list):
                     out[k].append(v)
@@ -83,12 +88,12 @@ def _normalize_headers(headers_obj) -> dict[str, object]:
     return out
 
 def _get_header(headers: Mapping[str, object], name: str) -> Optional[str]:
-    name_l = name.lower()
+    wanted = name.lower()
     for k, v in (headers or {}).items():
-        if str(k).lower() == name_l:
+        if str(k).lower() == wanted:
             if isinstance(v, (list, tuple)):
-                return _to_str(v[0]) if v else None
-            return _to_str(v)
+                return _as_text(v[0]) if v else None
+            return _as_text(v)
     return None
 
 def _maybe_gunzip(body: bytes, headers: Mapping[str, object]) -> bytes:
@@ -543,7 +548,7 @@ class TLSClient:
 
         raw = resp.read()
         status = getattr(resp, "status_code", getattr(resp, "status", "NA"))
-        resp_headers = _normalize_headers(getattr(resp, "headers", {}) or {})
+        resp_headers = normalize_headers_container(getattr(resp, "headers", {}) or {})
 
         if not raw:
             raise ValueError("Empty response body from local proxy /request")
