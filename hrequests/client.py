@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Union, Mapping
 from urllib.parse import urlencode
 
+from collections.abc import Mapping as _Mapping
+
+from ast import literal_eval
+
 from geventhttpclient import HTTPClient
 from geventhttpclient.header import Headers
 from orjson import dumps, loads, JSONDecodeError
@@ -65,7 +69,7 @@ def _to_str(x) -> str:
 def _normalize_headers(headers_obj) -> dict[str, object]:
     if not headers_obj:
         return {}
-    from collections.abc import Mapping as _Mapping
+    
     if isinstance(headers_obj, _Mapping):
         out = {}
         for k, v in headers_obj.items():
@@ -118,7 +122,7 @@ def _looks_like_json_bytes(b: bytes) -> bool:
 def _unwrap_bytearray_repr(body: bytes) -> Optional[bytes]:
     if not body.startswith(b"bytearray("):
         return None
-    from ast import literal_eval
+    
     try:
         obj = literal_eval(body.decode("utf-8", "replace"))
         if isinstance(obj, (bytearray, bytes)):
