@@ -26,7 +26,7 @@ jobs:
     name: Upload to TestPyPI
     needs: build
     runs-on: ubuntu-latest
-    environment: testpypi     # укажи такой env при добавлении publisher на TestPyPI
+    environment: velosiped    # укажи такой env при добавлении publisher на TestPyPI
     permissions:
       id-token: write
       contents: read
